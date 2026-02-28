@@ -1,0 +1,103 @@
+name: 'Container App Settings'
+description: 'Update Azure Container App environment variables from inline JSON or a JSON file'
+branding:
+  icon: 'settings'
+  color: 'blue'
+
+inputs:
+  app-name:
+    description: 'The name of the Azure Container App'
+    required: true
+  resource-group:
+    description: 'The Azure resource group containing the Container App'
+    required: true
+  settings:
+    description: >
+      JSON string of environment variables to set. Supported formats:
+      array of {"name": "KEY", "value": "VALUE"} objects, or a flat {"KEY": "VALUE"} object.
+    required: false
+    default: ''
+  settings-file:
+    description: >
+      Path to a JSON file containing environment variables.
+      Supports the same formats as the 'settings' input.
+    required: false
+    default: ''
+  subscription-id:
+    description: 'Azure subscription ID. Uses the current default subscription if not specified.'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Validate inputs
+      shell: bash
+      env:
+        SETTINGS: ${{ inputs.settings }}
+        SETTINGS_FILE: ${{ inputs.settings-file }}
+      run: |
+        if [ -z "$SETTINGS" ] && [ -z "$SETTINGS_FILE" ]; then
+          echo "::error::Either the 'settings' or 'settings-file' input must be provided."
+          exit 1
+        fi
+
+    - name: Set Azure subscription
+      if: inputs.subscription-id != ''
+      shell: bash
+      env:
+        SUBSCRIPTION_ID: ${{ inputs.subscription-id }}
+      run: az account set --subscription "$SUBSCRIPTION_ID"
+
+    - name: Update Container App environment variables
+      shell: bash
+      env:
+        SETTINGS: ${{ inputs.settings }}
+        SETTINGS_FILE: ${{ inputs.settings-file }}
+        APP_NAME: ${{ inputs.app-name }}
+        RESOURCE_GROUP: ${{ inputs.resource-group }}
+      run: |
+        # Load JSON from file or inline input
+        if [ -n "$SETTINGS_FILE" ]; then
+          if [ ! -f "$SETTINGS_FILE" ]; then
+            echo "::error::Settings file not found: $SETTINGS_FILE"
+            exit 1
+          fi
+          JSON_CONTENT=$(cat "$SETTINGS_FILE")
+        else
+          JSON_CONTENT="$SETTINGS"
+        fi
+
+        # Validate the JSON is parseable
+        if ! echo "$JSON_CONTENT" | jq empty > /dev/null 2>&1; then
+          echo "::error::Invalid JSON in settings input."
+          exit 1
+        fi
+
+        # Convert JSON to 'KEY=VALUE' pairs for az containerapp update.
+        # Supports array format: [{"name": "KEY", "value": "VALUE"}, ...]
+        # Supports object format: {"KEY": "VALUE", ...}
+        # Note: values containing newline characters are not supported.
+        if echo "$JSON_CONTENT" | jq -e 'type == "array"' > /dev/null 2>&1; then
+          INVALID_COUNT=$(echo "$JSON_CONTENT" | jq '[.[] | select(.name == null or .value == null)] | length')
+          if [ "$INVALID_COUNT" -gt 0 ]; then
+            echo "::warning::$INVALID_COUNT item(s) in the settings array are missing 'name' or 'value' and will be skipped."
+          fi
+          mapfile -t ENV_PAIRS < <(echo "$JSON_CONTENT" | jq -r '.[] | select(.name != null and .value != null) | "\(.name)=\(.value)"')
+        else
+          mapfile -t ENV_PAIRS < <(echo "$JSON_CONTENT" | jq -r 'to_entries[] | select(.value != null) | "\(.key)=\(.value)"')
+        fi
+
+        if [ ${#ENV_PAIRS[@]} -eq 0 ]; then
+          echo "::warning::No environment variables found in the provided JSON. Nothing to update."
+          exit 0
+        fi
+
+        echo "Updating ${#ENV_PAIRS[@]} environment variable(s) on container app '$APP_NAME'..."
+
+        az containerapp update \
+          --name "$APP_NAME" \
+          --resource-group "$RESOURCE_GROUP" \
+          --set-env-vars "${ENV_PAIRS[@]}"
+
+        echo "::notice::Successfully updated environment variables on container app '$APP_NAME'."
